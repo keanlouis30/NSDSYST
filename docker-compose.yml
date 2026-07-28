@@ -1,0 +1,124 @@
+name: mini-splunk
+
+networks:
+  minisplunk:
+    driver: bridge
+
+volumes:
+  rabbitmq_data:
+  es01_data:
+  es02_data:
+  es03_data:
+
+x-es-common: &es-common
+  image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+  environment: &es-env-common
+    cluster.name: mini-splunk-cluster
+    discovery.seed_hosts: elasticsearch-01,elasticsearch-02,elasticsearch-03
+    cluster.initial_master_nodes: elasticsearch-01,elasticsearch-02,elasticsearch-03
+    bootstrap.memory_lock: "true"
+    xpack.security.enabled: "false"
+    ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  networks:
+    - minisplunk
+  healthcheck:
+    test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -vq '\"status\":\"red\"'"]
+    interval: 10s
+    timeout: 5s
+    retries: 30
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    networks:
+      - minisplunk
+
+  elasticsearch-01:
+    <<: *es-common
+    environment:
+      <<: *es-env-common
+      node.name: elasticsearch-01
+    volumes:
+      - es01_data:/usr/share/elasticsearch/data
+
+  elasticsearch-02:
+    <<: *es-common
+    environment:
+      <<: *es-env-common
+      node.name: elasticsearch-02
+    volumes:
+      - es02_data:/usr/share/elasticsearch/data
+
+  elasticsearch-03:
+    <<: *es-common
+    environment:
+      <<: *es-env-common
+      node.name: elasticsearch-03
+    volumes:
+      - es03_data:/usr/share/elasticsearch/data
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      ES_HOSTS: http://elasticsearch-01:9200,http://elasticsearch-02:9200,http://elasticsearch-03:9200
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch-01:
+        condition: service_healthy
+      elasticsearch-02:
+        condition: service_healthy
+      elasticsearch-03:
+        condition: service_healthy
+    networks:
+      - minisplunk
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      ES_HOSTS: http://elasticsearch-01:9200,http://elasticsearch-02:9200,http://elasticsearch-03:9200
+      WORKER_PREFETCH: "20"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch-01:
+        condition: service_healthy
+      elasticsearch-02:
+        condition: service_healthy
+      elasticsearch-03:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - minisplunk
+
+  forwarder:
+    build:
+      context: .
+      dockerfile: forwarder/Dockerfile
+    profiles: ["tools"]
+    volumes:
+      - ./sample_logs:/logs
+    networks:
+      - minisplunk
