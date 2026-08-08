@@ -133,6 +133,23 @@ docker compose run --rm forwarder PURGE gateway:8000
 (From the host machine instead of another container, use `localhost:8000` as
 the Gateway_IP since port 8000 is published.)
 
+### Troubleshooting host restrictions
+
+Elasticsearch is the fussiest part of the stack about host limits:
+
+- **`error setting rlimit type 8: operation not permitted`** -- the host won't
+  grant unlimited locked memory (`RLIMIT_MEMLOCK`). This compose file already
+  avoids it: no `ulimits.memlock` block, and `bootstrap.memory_lock: "false"`.
+  Only re-enable both together on a host where you control limits.
+- **`max virtual memory areas vm.max_map_count [65530] is too low`** -- run
+  `sudo sysctl -w vm.max_map_count=262144` on the host (add it to
+  `/etc/sysctl.conf` to persist), or uncomment `node.store.allow_mmap: "false"`
+  in [docker-compose.yml](docker-compose.yml) if you can't change host sysctls.
+- **ES containers exiting on a small VM** -- three JVMs at 512 MB heap each
+  need roughly 3-4 GB of RAM. Lower `ES_JAVA_OPTS` to `-Xms256m -Xmx256m`, or
+  cut the cluster to two nodes (also drop the removed node from
+  `discovery.seed_hosts` and `cluster.initial_master_nodes`).
+
 ### Chaos testing
 
 ```bash
