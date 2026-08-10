@@ -16,12 +16,15 @@ Usage:
 """
 import socket
 import sys
+import time
 import uuid
 
 import requests
 
 BATCH_SIZE = 1000
 DEFAULT_PORT = 8000
+BATCH_ATTEMPTS = 5
+BATCH_RETRY_BACKOFF = 2.0
 QUERY_TYPES = {
     'SEARCH_DATE', 'SEARCH_HOST', 'SEARCH_DAEMON',
     'SEARCH_SEVERITY', 'SEARCH_KEYWORD', 'COUNT_KEYWORD',
@@ -37,6 +40,31 @@ def normalize_gateway(gateway_ip: str) -> str:
     return url.rstrip('/')
 
 
+def post_batch(gateway_url: str, payload: dict) -> int:
+    """POST one batch, retrying if the gateway or broker is briefly unavailable.
+
+    Retrying a whole batch is safe: each line carries a fixed (job_id, seq),
+    which becomes its Elasticsearch document id, so a replayed batch overwrites
+    its own documents instead of duplicating them.
+    """
+    last_error = None
+    for attempt in range(BATCH_ATTEMPTS):
+        try:
+            resp = requests.post(f'{gateway_url}/ingest', json=payload, timeout=60)
+            if resp.status_code >= 500:
+                raise requests.exceptions.HTTPError(f'{resp.status_code} {resp.text[:200]}')
+            resp.raise_for_status()
+            return resp.json()['lines_queued']
+        except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
+            last_error = exc
+            if attempt + 1 < BATCH_ATTEMPTS:
+                delay = BATCH_RETRY_BACKOFF * (attempt + 1)
+                print(f'  batch failed ({exc}); retrying in {delay:.0f}s', file=sys.stderr)
+                time.sleep(delay)
+
+    raise SystemExit(f'ingest aborted after {BATCH_ATTEMPTS} attempts: {last_error}')
+
+
 def cmd_ingest(file_path: str, gateway_ip: str):
     gateway_url = normalize_gateway(gateway_ip)
     job_id = str(uuid.uuid4())
@@ -48,15 +76,13 @@ def cmd_ingest(file_path: str, gateway_ip: str):
     total_queued = 0
     for start in range(0, len(lines), BATCH_SIZE):
         batch = lines[start:start + BATCH_SIZE]
-        resp = requests.post(f'{gateway_url}/ingest', json={
+        total_queued += post_batch(gateway_url, {
             'job_id': job_id,
             'source_host': source_host,
             'filename': file_path,
             'start_seq': start,
             'lines': batch,
         })
-        resp.raise_for_status()
-        total_queued += resp.json()['lines_queued']
         print(f'  queued lines {start}-{start + len(batch) - 1}')
 
     print(f'INGEST complete: job_id={job_id} lines_queued={total_queued}')

@@ -294,12 +294,34 @@ the operation to be visible to subsequent searches immediately rather than at
 the next periodic refresh, so a `PURGE` followed instantly by a `QUERY` cannot
 observe stale results.
 
-**6) Autonomous recovery.** Workers wrap their entire connection lifecycle in a
-retry loop with a fixed backoff, so broker unavailability produces reconnection
-rather than termination. Containers additionally carry
-`restart: unless-stopped`, so a killed process is restarted by the Docker
-daemon and rejoins the consumer pool with no operator action. Recovery is
-therefore autonomous at two independent levels.
+**6) Autonomous recovery.** Recovery from broker loss must be handled
+independently on both sides of the queue, because the two sides fail
+differently.
+
+*Consumer side.* Workers wrap their entire connection lifecycle in a retry loop
+with a fixed backoff, so broker unavailability produces reconnection rather
+than termination. Containers additionally carry `restart: unless-stopped`, so a
+killed process is restarted by the Docker daemon and rejoins the consumer pool
+with no operator action.
+
+*Producer side.* A broker restart force-closes the gateway's AMQP connection.
+Because the gateway is a long-lived service that caches its channel, a naive
+implementation continues publishing to a dead channel and fails every
+subsequent request until manually restarted — an availability bug that
+survives the broker's own recovery. The gateway therefore treats its cached
+connection as disposable: before each publish it validates the connection and
+channel, rebuilds them (re-declaring the queue and control exchange) if either
+is closed, and retries the publish with backoff, returning HTTP 503 only after
+repeated failure. Publish retry is safe precisely because of the idempotency
+property of Section II-C-3 — a line republished after an ambiguous failure
+carries the same `(job_id, seq)` and therefore the same document identifier,
+so a duplicated publish collapses into an overwrite. The forwarder applies the
+same reasoning one level up, retrying an entire failed batch rather than
+aborting the ingestion job.
+
+Recovery is therefore autonomous at three independent levels: process restart
+by the container runtime, connection retry within each component, and request
+retry by the client.
 
 ### D. Deployment and Containerization
 
@@ -461,15 +483,22 @@ durability from redelivery.
 | Documents after full recovery | *[FILL IN]* |
 
 **Experiment 3 — Broker restart with queued messages.**
-Restart the RabbitMQ container while messages are queued. *Expected:* because
-the queue is durable and messages persistent, the queue is restored from disk;
-workers reconnect through their retry loop without operator intervention.
+Restart the RabbitMQ container while messages are queued, then issue a fresh
+`INGEST` once the broker reports healthy. *Expected:* because the queue is
+durable and messages persistent, the queue is restored from disk; workers
+reconnect through their retry loop; and — critically — the gateway rebuilds its
+own publisher connection on the next request, so ingestion succeeds again
+**without restarting the gateway container**. The final check is the one that
+matters: a system that recovers its consumers but not its producers is not
+recovered.
 
 | Measurement | Value |
 |---|---|
 | Queued messages before restart | *[FILL IN]* |
 | Queued messages after restart | *[FILL IN]* |
 | Worker reconnection time | *[FILL IN]* |
+| `INGEST` succeeds post-restart without gateway restart | *[FILL IN — expect yes]* |
+| Documents after post-restart ingest | *[FILL IN]* |
 
 **Experiment 4 — Storage node failure.**
 Stop one Elasticsearch node and immediately issue queries. *Expected:* because

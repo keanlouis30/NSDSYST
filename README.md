@@ -69,8 +69,12 @@ aggregated results.
   RabbitMQ's at-least-once delivery.
 - **Autonomous recovery**: workers run a reconnect loop with backoff around
   the RabbitMQ connection, and `restart: unless-stopped` in compose brings a
-  killed container back up automatically. The ES cluster tolerates a node
-  loss because of its replica shard.
+  killed container back up automatically. The gateway validates and rebuilds
+  its own publisher connection before each publish, so a broker restart does
+  not leave it publishing to a dead channel; publishes and client batches are
+  retried with backoff (safe to retry, because of the deterministic document
+  ids above). The ES cluster tolerates a node loss because of its replica
+  shard.
 - **Distributed coordination for PURGE**: the gateway acquires a RabbitMQ
   exclusive queue as a mutex (only one purge can run at a time), broadcasts
   `pause` on the fanout exchange so workers stop consuming, waits a grace

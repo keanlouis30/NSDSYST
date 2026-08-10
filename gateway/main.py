@@ -11,6 +11,7 @@ is mid-write while the index is cleared.
 """
 import asyncio
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -30,9 +31,16 @@ from common.mq import (
 from common.es_client import INDEX_BODY, INDEX_NAME, es_hosts
 
 PURGE_PAUSE_GRACE_SECONDS = float(os.environ.get('PURGE_PAUSE_GRACE_SECONDS', '3'))
+PUBLISH_ATTEMPTS = int(os.environ.get('PUBLISH_ATTEMPTS', '4'))
+PUBLISH_RETRY_BACKOFF = float(os.environ.get('PUBLISH_RETRY_BACKOFF', '1.5'))
 MAX_RESULTS = 500
 
+# Broker failures worth rebuilding the connection for (as opposed to real bugs).
+BROKER_ERRORS = (aio_pika.exceptions.AMQPError, ConnectionError, OSError, asyncio.TimeoutError)
+
 app = FastAPI(title='Mini-Splunk Gateway')
+
+log = logging.getLogger('gateway')
 
 state = {}
 
@@ -45,12 +53,65 @@ class IngestRequest(BaseModel):
     lines: List[str]
 
 
-@app.on_event('startup')
-async def startup():
+async def connect_broker():
+    """Open a connection/channel and (re)declare the topology."""
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     channel = await connection.channel()
     await channel.declare_queue(INGEST_QUEUE, durable=True)
-    control_exchange = await channel.declare_exchange(CONTROL_EXCHANGE, aio_pika.ExchangeType.FANOUT, durable=True)
+    control_exchange = await channel.declare_exchange(
+        CONTROL_EXCHANGE, aio_pika.ExchangeType.FANOUT, durable=True)
+
+    state['connection'] = connection
+    state['channel'] = channel
+    state['control_exchange'] = control_exchange
+    return channel, control_exchange
+
+
+async def get_broker():
+    """Return a live (channel, control_exchange).
+
+    A broker restart force-closes our connection; the objects cached in
+    `state` then refer to a dead channel forever. Rebuilding them on demand
+    is what makes the gateway recover autonomously instead of failing every
+    request until it is manually restarted.
+    """
+    async with state['broker_lock']:
+        connection = state.get('connection')
+        channel = state.get('channel')
+        if connection is not None and not connection.is_closed and channel is not None and not channel.is_closed:
+            return channel, state['control_exchange']
+
+        log.warning('broker connection is not usable, re-establishing')
+        if connection is not None:
+            try:
+                await connection.close()
+            except Exception:
+                pass
+        return await connect_broker()
+
+
+async def invalidate_broker():
+    """Drop the cached connection so the next get_broker() rebuilds it."""
+    async with state['broker_lock']:
+        connection = state.pop('connection', None)
+        state.pop('channel', None)
+        state.pop('control_exchange', None)
+        if connection is not None:
+            try:
+                await connection.close()
+            except Exception:
+                pass
+
+
+@app.on_event('startup')
+async def startup():
+    state['broker_lock'] = asyncio.Lock()
+    try:
+        await connect_broker()
+    except BROKER_ERRORS as exc:
+        # Don't die on startup if the broker isn't up yet -- the first request
+        # will establish the connection instead.
+        log.warning('broker unavailable at startup (%s); will connect on demand', exc)
 
     es = AsyncElasticsearch(hosts=es_hosts())
     if not await es.indices.exists(index=INDEX_NAME):
@@ -59,16 +120,15 @@ async def startup():
         except Exception:
             pass  # another gateway replica / race: index already created concurrently
 
-    state['connection'] = connection
-    state['channel'] = channel
-    state['control_exchange'] = control_exchange
     state['es'] = es
 
 
 @app.on_event('shutdown')
 async def shutdown():
     await state['es'].close()
-    await state['connection'].close()
+    connection = state.get('connection')
+    if connection is not None:
+        await connection.close()
 
 
 @app.get('/health')
@@ -76,27 +136,48 @@ async def health():
     return {'status': 'ok'}
 
 
+async def publish_line(payload: dict):
+    """Publish one line, rebuilding the broker connection and retrying if the
+    broker went away. Safe to retry: a line republished after an ambiguous
+    failure lands on the same deterministic ES document id (job_id:seq), so a
+    duplicate publish collapses into an overwrite rather than a second row."""
+    message = aio_pika.Message(
+        body=json.dumps(payload).encode('utf-8'),
+        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        content_type='application/json',
+    )
+
+    last_exc = None
+    for attempt in range(PUBLISH_ATTEMPTS):
+        try:
+            channel, _ = await get_broker()
+            await channel.default_exchange.publish(message, routing_key=INGEST_QUEUE)
+            return
+        except BROKER_ERRORS as exc:
+            last_exc = exc
+            log.warning('publish attempt %s/%s failed: %s', attempt + 1, PUBLISH_ATTEMPTS, exc)
+            await invalidate_broker()
+            if attempt + 1 < PUBLISH_ATTEMPTS:
+                await asyncio.sleep(PUBLISH_RETRY_BACKOFF * (attempt + 1))
+
+    raise HTTPException(503, f'broker unavailable, could not queue line: {last_exc}')
+
+
 @app.post('/ingest')
 async def ingest(req: IngestRequest):
-    channel = state['channel']
+    queued = 0
     for i, raw_line in enumerate(req.lines):
         if not raw_line.strip():
             continue
-        seq = req.start_seq + i
-        payload = {
+        await publish_line({
             'job_id': req.job_id,
-            'seq': seq,
+            'seq': req.start_seq + i,
             'source_host': req.source_host,
             'filename': req.filename,
             'raw_line': raw_line,
-        }
-        message = aio_pika.Message(
-            body=json.dumps(payload).encode('utf-8'),
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            content_type='application/json',
-        )
-        await channel.default_exchange.publish(message, routing_key=INGEST_QUEUE)
-    return {'job_id': req.job_id, 'lines_queued': len(req.lines)}
+        })
+        queued += 1
+    return {'job_id': req.job_id, 'lines_queued': queued}
 
 
 def _day_range(date_string: str):
@@ -151,7 +232,7 @@ async def purge():
         raise HTTPException(409, 'a purge is already in progress')
 
     try:
-        control_exchange = state['control_exchange']
+        _, control_exchange = await get_broker()
         await control_exchange.publish(aio_pika.Message(body=PAUSE_MSG), routing_key='')
         await asyncio.sleep(PURGE_PAUSE_GRACE_SECONDS)
 
