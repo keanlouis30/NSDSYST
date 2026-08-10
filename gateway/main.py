@@ -36,6 +36,7 @@ PURGE_PAUSE_GRACE_SECONDS = float(os.environ.get('PURGE_PAUSE_GRACE_SECONDS', '3
 PUBLISH_ATTEMPTS = int(os.environ.get('PUBLISH_ATTEMPTS', '4'))
 PUBLISH_RETRY_BACKOFF = float(os.environ.get('PUBLISH_RETRY_BACKOFF', '1.5'))
 READER_DRAIN_TIMEOUT = float(os.environ.get('READER_DRAIN_TIMEOUT', '10'))
+PURGE_SWEEP_DELAY_SECONDS = float(os.environ.get('PURGE_SWEEP_DELAY_SECONDS', '2'))
 MAX_RESULTS = 500
 
 # Broker failures worth rebuilding the connection for (as opposed to real bugs).
@@ -43,6 +44,7 @@ BROKER_ERRORS = (aio_pika.exceptions.AMQPError, ConnectionError, OSError, asynci
 
 app = FastAPI(title='Mini-Splunk Gateway')
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 log = logging.getLogger('gateway')
 
 state = {}
@@ -164,6 +166,10 @@ async def startup():
     state['broker_lock'] = asyncio.Lock()
     state['purge_active'] = False
     state['readers'] = 0
+    # Every purge starts a new epoch. An ingestion job belongs to the epoch it
+    # started in, so a purge invalidates any job that was in flight across it.
+    state['purge_epoch'] = 0
+    state['job_epochs'] = {}
     try:
         await connect_broker()
     except BROKER_ERRORS as exc:
@@ -192,6 +198,41 @@ async def shutdown():
 @app.get('/health')
 async def health():
     return {'status': 'ok'}
+
+
+@app.get('/status')
+async def status():
+    """Live counters for chaos testing: queue depth vs. indexed documents.
+
+    `queue_depth` counts messages still waiting; messages currently held
+    unacknowledged by a worker are not included, so depth 0 does not by
+    itself mean ingestion has finished.
+    """
+    queue_depth = None
+    consumers = None
+    try:
+        channel, _ = await get_broker()
+        queue = await channel.get_queue(INGEST_QUEUE, ensure=True)
+        declare_ok = await queue.channel.queue_declare(INGEST_QUEUE, passive=True)
+        queue_depth = declare_ok.message_count
+        consumers = declare_ok.consumer_count
+    except Exception as exc:
+        log.warning('status: could not read queue depth: %s', exc)
+
+    documents = None
+    try:
+        result = await state['es'].count(index=INDEX_NAME)
+        documents = result['count']
+    except Exception as exc:
+        log.warning('status: could not read document count: %s', exc)
+
+    return {
+        'queue_depth': queue_depth,
+        'queue_consumers': consumers,
+        'documents_indexed': documents,
+        'purge_active': state.get('purge_active', False),
+        'readers_in_flight': state.get('readers', 0),
+    }
 
 
 async def publish_line(payload: dict):
@@ -224,6 +265,16 @@ async def publish_line(payload: dict):
 @app.post('/ingest')
 async def ingest(req: IngestRequest):
     async with reader_slot():
+        # An ingestion spans many batches. If a purge lands between batches,
+        # resuming would re-populate the index the purge just cleared, so the
+        # remainder of the job is refused rather than accepted.
+        epoch = state['purge_epoch']
+        started_in = state['job_epochs'].setdefault(req.job_id, epoch)
+        if started_in != epoch:
+            log.info('refusing batch of job %s: invalidated by a PURGE', req.job_id)
+            raise HTTPException(
+                409, 'this ingestion job was invalidated by a PURGE; start a new INGEST')
+
         queued = 0
         for i, raw_line in enumerate(req.lines):
             if not raw_line.strip():
@@ -313,21 +364,35 @@ async def purge():
         if state['readers'] > 0:
             log.warning('proceeding with purge while %s reader(s) still in flight', state['readers'])
 
+        log.info('PURGE: lock acquired, readers drained')
         channel, control_exchange = await get_broker()
 
         # 3. Pause every worker. Workers finish the message in hand, then stop
         #    consuming -- no worker is writing to a shard past this point.
         await control_exchange.publish(aio_pika.Message(body=PAUSE_MSG), routing_key='')
+        log.info('PURGE: pause broadcast sent, waiting %ss', PURGE_PAUSE_GRACE_SECONDS)
         await asyncio.sleep(PURGE_PAUSE_GRACE_SECONDS)
 
-        # 4. Discard queued-but-unprocessed lines.
+        # 4. Discard queued-but-unprocessed lines. Note this removes *ready*
+        #    messages; any still unacknowledged at a worker are requeued by the
+        #    worker's consumer cancellation, so the queue is swept again below.
         discarded = 0
         try:
             queue = await channel.get_queue(INGEST_QUEUE, ensure=True)
             result = await queue.purge()
             discarded = getattr(result, 'message_count', 0) or 0
+            log.info('PURGE: discarded %s queued line(s)', discarded)
+
+            # Second sweep: messages that were unacked at pause time get
+            # requeued by the workers and can land after the first purge.
+            await asyncio.sleep(PURGE_SWEEP_DELAY_SECONDS)
+            result = await queue.purge()
+            swept = getattr(result, 'message_count', 0) or 0
+            if swept:
+                log.info('PURGE: swept %s requeued line(s) on second pass', swept)
+            discarded += swept
         except aio_pika.exceptions.AMQPError as exc:
-            log.warning('could not purge ingest queue: %s', exc)
+            log.warning('PURGE: could not purge ingest queue: %s', exc)
 
         # 5. Clear the index. refresh=True makes the deletion visible to the
         #    very next query rather than at the next periodic refresh.
@@ -340,9 +405,16 @@ async def purge():
         except NotFoundError:
             pass
 
+        log.info('PURGE: deleted %s document(s) from the index', deleted)
+
         # 6. Release workers, then the mutex.
         await control_exchange.publish(aio_pika.Message(body=RESUME_MSG), routing_key='')
+        log.info('PURGE: resume broadcast sent, releasing lock')
     finally:
+        # Start a new epoch: any ingestion job that spanned this purge is now
+        # invalid and its remaining batches will be refused.
+        state['purge_epoch'] += 1
+        state['job_epochs'].clear()
         state['purge_active'] = False
         await lock_connection.close()
 

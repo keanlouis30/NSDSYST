@@ -294,7 +294,25 @@ during a 10,000-line ingestion left thousands of documents behind. `PURGE`
 therefore also purges the `logs.ingest` queue, discarding pending lines, and
 reports the count of discarded lines alongside the count of deleted documents.
 This is the coherent reading of "deletes all indexed log entries": work already
-admitted for indexing is part of the state being cleared.
+admitted for indexing is part of the state being cleared. Because
+`queue.purge()` removes only *ready* messages, and messages held unacknowledged
+by a paused worker are requeued by its consumer cancellation, the queue is
+swept a second time after a short delay to catch them.
+
+*Epoch invalidation.* Discarding the queue is still not sufficient, because an
+ingestion is not a single request — a large file is uploaded as a sequence of
+batches. Clearing the queue removes the batches already sent, but the client
+holds the rest. Measured behaviour of an implementation without this safeguard:
+a purge issued 2,000 lines into a 10,000-line ingestion deleted exactly those
+2,000 documents and discarded 0 queued lines, after which the client submitted
+its remaining batches and the index settled at 8,000 documents — a purge
+followed by a non-empty index. The system therefore versions ingestion: each
+purge increments a **purge epoch**, and the first batch of a job binds that job
+to the epoch it began in. A batch whose job belongs to a superseded epoch is
+refused with HTTP 409, so an ingestion cannot survive a purge that occurred
+part-way through it. The client abandons the job on 409 rather than retrying —
+and critically, the guarantee does not depend on that client cooperation, since
+the gateway refuses the batches regardless of what the client chooses to do.
 
 The full sequence is:
 
@@ -565,7 +583,8 @@ itself.
 |---|---|
 | Documents immediately after purge (expect 0) | *[FILL IN]* |
 | Queued lines discarded (reported by `PURGE`) | *[FILL IN]* |
-| Ingest requests refused with 409 during purge | *[FILL IN]* |
+| Documents deleted (reported by `PURGE`) | *[FILL IN]* |
+| Client outcome (expect: INGEST aborted, job invalidated) | *[FILL IN]* |
 | Documents 30s after purge, workers resumed (expect 0) | *[FILL IN]* |
 
 ---

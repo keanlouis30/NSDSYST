@@ -82,7 +82,11 @@ aggregated results.
   `pause` so workers stop consuming, discards pending queued lines, clears the
   index, then broadcasts `resume` and releases the lock. Discarding the queue
   matters: without it, workers drain the backlog on resume and immediately
-  re-populate the index, so the purge undoes itself.
+  re-populate the index, so the purge undoes itself. Each purge also starts a
+  new **epoch**, which invalidates any multi-batch ingestion that was in
+  flight — otherwise the client's remaining batches would refill the index
+  after the purge completed. An `INGEST` interrupted by a `PURGE` aborts and
+  must be re-run.
 
 ### Known simplifications (documented, not hidden)
 

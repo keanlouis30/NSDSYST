@@ -46,11 +46,22 @@ def post_batch(gateway_url: str, payload: dict) -> int:
     Retrying a whole batch is safe: each line carries a fixed (job_id, seq),
     which becomes its Elasticsearch document id, so a replayed batch overwrites
     its own documents instead of duplicating them.
+
+    A 409 is the one status that is *not* retried -- it means a PURGE claimed
+    the system, and resuming afterwards would refill the index that the purge
+    just emptied.
     """
     last_error = None
     for attempt in range(BATCH_ATTEMPTS):
         try:
             resp = requests.post(f'{gateway_url}/ingest', json=payload, timeout=60)
+            if resp.status_code == 409:
+                # A PURGE is running or ran mid-job. Retrying would re-populate
+                # the index the purge just cleared, so the job is abandoned.
+                raise SystemExit(
+                    'INGEST aborted: a PURGE occurred during this ingestion. '
+                    'Nothing from this job remains indexed; re-run INGEST when '
+                    'the purge has finished.')
             if resp.status_code >= 500:
                 raise requests.exceptions.HTTPError(f'{resp.status_code} {resp.text[:200]}')
             resp.raise_for_status()
