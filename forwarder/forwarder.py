@@ -95,6 +95,9 @@ def cmd_query(gateway_ip: str, search_type: str, value: str):
         sys.exit(1)
 
     resp = requests.get(f'{gateway_url}/query', params={'type': search_type, 'value': value})
+    if resp.status_code == 409:
+        print('QUERY refused: a PURGE is in progress; retry shortly', file=sys.stderr)
+        sys.exit(1)
     resp.raise_for_status()
     data = resp.json()
 
@@ -115,7 +118,10 @@ def cmd_purge(gateway_ip: str):
         print('PURGE rejected: another purge is already in progress')
         sys.exit(1)
     resp.raise_for_status()
-    print('PURGE complete: all indexed log entries deleted')
+    data = resp.json()
+    print('PURGE complete: all indexed log entries deleted '
+          f"(documents deleted: {data.get('documents_deleted', '?')}, "
+          f"queued lines discarded: {data.get('queued_lines_discarded', '?')})")
 
 
 def main():

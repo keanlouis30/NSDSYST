@@ -264,27 +264,56 @@ orphaned. A deliberately non-robust (non-auto-reconnecting) connection is used
 for this purpose, so that a network partition releases the lock rather than
 silently reasserting it.
 
+*Reader admission control.* The mutex alone only excludes *other purges*. The
+specification requires that no node be reading or writing the shards during the
+clear, so purge is modelled as the **writer** of a reader-writer lock in which
+ingestion and query are the readers. On acquiring the mutex the gateway raises
+a purge flag; every subsequent `INGEST` or `QUERY` is refused with HTTP 409
+rather than queued, and the purge then waits (bounded by
+`READER_DRAIN_TIMEOUT`) for requests admitted before the flag was raised to
+complete. Readers consult the flag through `purge_in_progress()`, which checks
+local state first and otherwise performs a *passive* declaration of the lock
+queue — a purge started by a different gateway replica is therefore still
+observed, because the lock resides in the broker rather than in any single
+process. An ambiguous broker error during the check is interpreted as "locked",
+so uncertainty is resolved in favour of consistency; the client simply retries.
+
 *Barrier.* Holding the mutex, the gateway broadcasts `pause` on the
 `control.purge` fanout exchange. Each worker, on receipt, cancels its ingest
-consumer — it stops accepting new work while finishing any message already in
-hand. After a configurable grace period (`PURGE_PAUSE_GRACE_SECONDS`, default
-3s) the gateway issues `delete_by_query` with `conflicts=proceed` and
-`refresh=true`, then broadcasts `resume` and closes the lock connection.
-Workers reinstate their consumers and drain the backlog that accumulated in the
-queue during the pause — queued work is delayed by a purge, never destroyed by
-one.
+consumer. Because a worker's AMQP event loop is single-threaded, the control
+message can only be dispatched *between* ingest callbacks — never in the middle
+of one — so a paused worker is guaranteed not to be mid-write; the grace period
+(`PURGE_PAUSE_GRACE_SECONDS`, default 3s) covers broadcast propagation rather
+than write completion.
 
-The sequence is:
+*Queue discard.* Pausing the workers stops writes but does not stop the *cause*
+of writes: lines already queued remain queued. An early implementation cleared
+the index and then resumed the workers, which promptly drained the backlog and
+re-populated the index — the purge silently undid itself, and a purge issued
+during a 10,000-line ingestion left thousands of documents behind. `PURGE`
+therefore also purges the `logs.ingest` queue, discarding pending lines, and
+reports the count of discarded lines alongside the count of deleted documents.
+This is the coherent reading of "deletes all indexed log entries": work already
+admitted for indexing is part of the state being cleared.
+
+The full sequence is:
 
 ```
-acquire purge.lock (exclusive queue)  ─── fails ──> HTTP 409, abort
+acquire purge.lock (exclusive queue) ─── fails ──> HTTP 409, abort
         │ acquired
-        ├─> broadcast "pause"  ──> all workers cancel ingest consumers
-        ├─> wait grace period  ──> in-flight writes complete
+        ├─> raise purge flag        ──> new INGEST/QUERY refused with 409
+        ├─> drain in-flight readers ──> bounded wait
+        ├─> broadcast "pause"       ──> all workers cancel ingest consumers
+        ├─> wait grace period       ──> broadcast propagates
+        ├─> queue.purge()           ──> discard pending queued lines
         ├─> delete_by_query(match_all, refresh)
-        ├─> broadcast "resume" ──> all workers resume consuming
-        └─> close lock connection (releases mutex)
+        ├─> broadcast "resume"      ──> all workers resume consuming
+        └─> close lock connection   ──> releases mutex; flag lowered
 ```
+
+Exclusivity is therefore enforced at three scopes: against other purges by the
+broker-held mutex, against clients by reader admission control, and against
+workers by the pause barrier and queue discard.
 
 **5) Data-layer consistency.** Within Elasticsearch, replica shards are kept
 consistent by primary-backup replication: a write is routed to the primary
@@ -524,17 +553,20 @@ working distributed mutual exclusion.
 | Purges rejected with 409 | *[FILL IN]* |
 
 **Experiment 6 — Purge concurrent with ingestion.**
-Issue `PURGE` while an ingestion is actively draining. *Expected:* workers
-pause on the broadcast signal, the index is cleared cleanly with no partial or
-torn state, workers resume, and the still-queued remainder of the ingestion is
-processed afterward — demonstrating that the barrier delays work rather than
-destroying it.
+Begin a large ingestion and issue `PURGE` while the queue is still draining.
+*Expected:* ingest requests arriving during the purge are refused with HTTP
+409, workers pause, the pending queue is discarded, the index is cleared, and
+the index stays empty afterwards. The decisive check is the count taken
+*after* workers resume: an implementation that clears only the index leaves the
+backlog to re-populate it, so a non-zero count here indicates the purge undid
+itself.
 
 | Measurement | Value |
 |---|---|
 | Documents immediately after purge (expect 0) | *[FILL IN]* |
-| Queued messages surviving the purge | *[FILL IN]* |
-| Documents after post-purge drain | *[FILL IN]* |
+| Queued lines discarded (reported by `PURGE`) | *[FILL IN]* |
+| Ingest requests refused with 409 during purge | *[FILL IN]* |
+| Documents 30s after purge, workers resumed (expect 0) | *[FILL IN]* |
 
 ---
 

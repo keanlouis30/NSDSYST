@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import sys
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -33,6 +35,7 @@ from common.es_client import INDEX_BODY, INDEX_NAME, es_hosts
 PURGE_PAUSE_GRACE_SECONDS = float(os.environ.get('PURGE_PAUSE_GRACE_SECONDS', '3'))
 PUBLISH_ATTEMPTS = int(os.environ.get('PUBLISH_ATTEMPTS', '4'))
 PUBLISH_RETRY_BACKOFF = float(os.environ.get('PUBLISH_RETRY_BACKOFF', '1.5'))
+READER_DRAIN_TIMEOUT = float(os.environ.get('READER_DRAIN_TIMEOUT', '10'))
 MAX_RESULTS = 500
 
 # Broker failures worth rebuilding the connection for (as opposed to real bugs).
@@ -90,6 +93,59 @@ async def get_broker():
         return await connect_broker()
 
 
+@asynccontextmanager
+async def reader_slot():
+    """Admission control for INGEST/QUERY.
+
+    PURGE is a writer that must observe a quiescent system; ingest and query
+    are readers. A reader that arrives while a purge is in progress is
+    rejected outright (the client retries) rather than queued, and a purge
+    waits for already-admitted readers to finish before touching the index.
+    """
+    if await purge_in_progress():
+        raise HTTPException(409, 'a PURGE is in progress; retry shortly')
+    state['readers'] += 1
+    try:
+        yield
+    finally:
+        state['readers'] -= 1
+
+
+async def purge_in_progress() -> bool:
+    """Check the distributed purge lock without acquiring it.
+
+    The local flag covers requests handled by this gateway process; the
+    passive queue declaration covers a purge started by a *different* gateway
+    replica, since the lock lives in the broker rather than in any one
+    process. An ambiguous broker error is treated as "locked" so that
+    uncertainty never costs consistency -- the client simply retries.
+    """
+    if state.get('purge_active'):
+        return True
+
+    connection = state.get('connection')
+    if connection is None or connection.is_closed:
+        return False
+
+    channel = None
+    try:
+        # A failed passive declare closes the channel it runs on, so this must
+        # never be the channel used for publishing.
+        channel = await connection.channel()
+        await channel.get_queue(PURGE_LOCK_QUEUE, ensure=True)
+        return True
+    except aio_pika.exceptions.ChannelNotFoundEntity:
+        return False  # lock queue absent -> no purge running
+    except aio_pika.exceptions.AMQPError:
+        return True
+    finally:
+        if channel is not None and not channel.is_closed:
+            try:
+                await channel.close()
+            except Exception:
+                pass
+
+
 async def invalidate_broker():
     """Drop the cached connection so the next get_broker() rebuilds it."""
     async with state['broker_lock']:
@@ -106,6 +162,8 @@ async def invalidate_broker():
 @app.on_event('startup')
 async def startup():
     state['broker_lock'] = asyncio.Lock()
+    state['purge_active'] = False
+    state['readers'] = 0
     try:
         await connect_broker()
     except BROKER_ERRORS as exc:
@@ -165,19 +223,20 @@ async def publish_line(payload: dict):
 
 @app.post('/ingest')
 async def ingest(req: IngestRequest):
-    queued = 0
-    for i, raw_line in enumerate(req.lines):
-        if not raw_line.strip():
-            continue
-        await publish_line({
-            'job_id': req.job_id,
-            'seq': req.start_seq + i,
-            'source_host': req.source_host,
-            'filename': req.filename,
-            'raw_line': raw_line,
-        })
-        queued += 1
-    return {'job_id': req.job_id, 'lines_queued': queued}
+    async with reader_slot():
+        queued = 0
+        for i, raw_line in enumerate(req.lines):
+            if not raw_line.strip():
+                continue
+            await publish_line({
+                'job_id': req.job_id,
+                'seq': req.start_seq + i,
+                'source_host': req.source_host,
+                'filename': req.filename,
+                'raw_line': raw_line,
+            })
+            queued += 1
+        return {'job_id': req.job_id, 'lines_queued': queued}
 
 
 def _day_range(date_string: str):
@@ -204,25 +263,39 @@ def build_query(search_type: str, value: str) -> dict:
 
 @app.get('/query')
 async def query(type: str, value: str):
-    es = state['es']
     es_query = build_query(type, value)
 
-    if type == 'COUNT_KEYWORD':
-        result = await es.count(index=INDEX_NAME, query=es_query)
-        return {'keyword': value, 'count': result['count']}
+    async with reader_slot():
+        es = state['es']
+        if type == 'COUNT_KEYWORD':
+            result = await es.count(index=INDEX_NAME, query=es_query)
+            return {'keyword': value, 'count': result['count']}
 
-    result = await es.search(
-        index=INDEX_NAME,
-        query=es_query,
-        size=MAX_RESULTS,
-        sort=[{'timestamp': 'asc'}],
-    )
-    hits = [hit['_source'] for hit in result['hits']['hits']]
-    return {'count': result['hits']['total']['value'], 'results': hits}
+        result = await es.search(
+            index=INDEX_NAME,
+            query=es_query,
+            size=MAX_RESULTS,
+            sort=[{'timestamp': 'asc'}],
+        )
+        hits = [hit['_source'] for hit in result['hits']['hits']]
+        return {'count': result['hits']['total']['value'], 'results': hits}
 
 
 @app.post('/purge')
 async def purge():
+    """Stop-the-world deletion of all indexed log entries.
+
+    The operation is exclusive against every other operation in the system:
+    concurrent purges are refused by the broker-held mutex, new ingests and
+    queries are refused while it runs, already-admitted requests are drained
+    first, and workers are paused so no shard is written mid-delete.
+
+    Pending queued lines are discarded as part of the purge. Retaining them
+    would mean the workers immediately re-populate the index on resume, so
+    the purge would silently undo itself.
+    """
+    # 1. Distributed mutex: exclusive-queue ownership is broker-enforced, so
+    #    only one purge can exist system-wide, and a gateway crash releases it.
     lock_connection = await aio_pika.connect(RABBITMQ_URL)
     lock_channel = await lock_connection.channel()
     try:
@@ -231,19 +304,50 @@ async def purge():
         await lock_connection.close()
         raise HTTPException(409, 'a purge is already in progress')
 
+    state['purge_active'] = True  # from here on, readers are refused
     try:
-        _, control_exchange = await get_broker()
+        # 2. Drain requests admitted before the flag was raised.
+        deadline = time.monotonic() + READER_DRAIN_TIMEOUT
+        while state['readers'] > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if state['readers'] > 0:
+            log.warning('proceeding with purge while %s reader(s) still in flight', state['readers'])
+
+        channel, control_exchange = await get_broker()
+
+        # 3. Pause every worker. Workers finish the message in hand, then stop
+        #    consuming -- no worker is writing to a shard past this point.
         await control_exchange.publish(aio_pika.Message(body=PAUSE_MSG), routing_key='')
         await asyncio.sleep(PURGE_PAUSE_GRACE_SECONDS)
 
+        # 4. Discard queued-but-unprocessed lines.
+        discarded = 0
+        try:
+            queue = await channel.get_queue(INGEST_QUEUE, ensure=True)
+            result = await queue.purge()
+            discarded = getattr(result, 'message_count', 0) or 0
+        except aio_pika.exceptions.AMQPError as exc:
+            log.warning('could not purge ingest queue: %s', exc)
+
+        # 5. Clear the index. refresh=True makes the deletion visible to the
+        #    very next query rather than at the next periodic refresh.
+        deleted = 0
         es = state['es']
         try:
-            await es.delete_by_query(index=INDEX_NAME, query={'match_all': {}}, refresh=True, conflicts='proceed')
+            result = await es.delete_by_query(
+                index=INDEX_NAME, query={'match_all': {}}, refresh=True, conflicts='proceed')
+            deleted = result.get('deleted', 0)
         except NotFoundError:
             pass
 
+        # 6. Release workers, then the mutex.
         await control_exchange.publish(aio_pika.Message(body=RESUME_MSG), routing_key='')
     finally:
+        state['purge_active'] = False
         await lock_connection.close()
 
-    return {'status': 'purged'}
+    return {
+        'status': 'purged',
+        'documents_deleted': deleted,
+        'queued_lines_discarded': discarded,
+    }

@@ -75,10 +75,14 @@ aggregated results.
   retried with backoff (safe to retry, because of the deterministic document
   ids above). The ES cluster tolerates a node loss because of its replica
   shard.
-- **Distributed coordination for PURGE**: the gateway acquires a RabbitMQ
-  exclusive queue as a mutex (only one purge can run at a time), broadcasts
-  `pause` on the fanout exchange so workers stop consuming, waits a grace
-  period, clears the index, then broadcasts `resume`.
+- **Distributed coordination for PURGE**: purge is a stop-the-world operation,
+  exclusive against *every* other operation. The gateway acquires a RabbitMQ
+  exclusive queue as a mutex (only one purge system-wide), refuses new
+  `INGEST`/`QUERY` requests with HTTP 409 and drains in-flight ones, broadcasts
+  `pause` so workers stop consuming, discards pending queued lines, clears the
+  index, then broadcasts `resume` and releases the lock. Discarding the queue
+  matters: without it, workers drain the backlog on resume and immediately
+  re-populate the index, so the purge undoes itself.
 
 ### Known simplifications (documented, not hidden)
 
